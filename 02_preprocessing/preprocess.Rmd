@@ -1,0 +1,748 @@
+---
+title: "Sentence pause duration"
+subtitle: "Between sentence pause duration correction"
+date: "`r Sys.Date()`"
+output:
+  tufte::tufte_html: default
+---
+<link rel="stylesheet" href="/Users/pol.van-rijn/MPI/General/Templates/Tufte/extra.css"/>
+
+```{r setup, include=FALSE}
+library(tufte)
+# invalidate cache when the tufte version changes
+knitr::opts_chunk$set(tidy = FALSE, cache.extra = packageVersion('tufte'))
+options(htmltools.dir.version = FALSE)
+```
+
+```{r libraries, message=F, warning = F}
+library(dplyr)
+library(rPraat)
+library(ggplot2)
+library(fitdistrplus)
+library(readxl)
+```
+
+# Introduction
+In this markdown document, you can read how we process the raw recordings to the recordings how they are published.
+
+# Misread passages
+Here you can find an overview of all discrepancies between text and recording; `in both` indicates that the same discrepancy occurred in both speakers
+```{r}
+mistakes_df = read_excel('../data/stories/original/annotated_mistakes.xlsx')
+mistakes_df %>%
+  group_by(Reason, Gender) %>%
+  summarise(count = length(Reason)) %>%
+  ggplot() +
+  geom_bar(aes(x = Reason, y = count, fill = Reason), stat = "identity") +
+  facet_wrap(. ~ Gender) +
+  theme(axis.text.x = element_blank())
+```
+
+
+# Correcting the pause durations between sentences
+The pauses between the sentences (BSP, between sentence pause) in the recording of the stories sound unnatural. We therefore do the following processes:
+ 1. we show that the BSP distribution in the story corpus is very different from the BSP distribution in other speech corpora
+ 2. we do find that the BSP distribution is similar across corpora.
+ 3. to fix the unnatural BSP distribution in the story corpus, we sample from the stories
+
+
+## Story corpus distribution
+In a first step we compute where the sentences start and end and cut each recording of the story into its 128 sentences.
+```{r split_sentences_story_corpus, cache=T, message=F, results='hide', warning=F,}
+source('split_sentences_story_corpus.R')
+```
+
+Once we have this information, we can simply extract the BSP by taking the pause between the last word of the preceding sentence and the first word of the next sentence:
+```{r story_BPS, cache=T}
+# Grab the text grid files
+ORIGINAL_STORIES_PATH = '../data/stories/original/'
+sentence_duration = read.csv(paste0(ORIGINAL_STORIES_PATH, 'durations_all_stories_and_speakers.csv'))
+durations = c()
+for (g in c('M', 'F')) {
+  for (s in 1:8) {
+    filt_df = filter(sentence_duration, gender == g, story == s)
+    # just take the pause between the last word of the preceding sentence and the first word of the next sentence
+    durations = c(durations, filt_df$start[2:nrow(filt_df)] - filt_df$end[1:(nrow(filt_df) - 1)])
+  }
+}
+
+story_corpus = data.frame(duration = durations)
+```
+
+## Other corpora
+In order to have some comparison to other BSPs, we extract a BSP from manually checked transcripts of Goethe's *Die Wahlverwandtschaften* and automatically generated transcripts for stories from *Librivox*. Even though both stories are in different languages (English and German), they allow to compare BSPs computed using manually checked and automatically generated transcripts.
+
+### Goethe
+The first chapter of Goethe's *Die Wahlverwandtschaften* was read by 8 German speakers. All the phonological transcripts were manually set and checked.
+
+```{r goethe_helpers, cache=T}
+# HELPER FUNCTIONS
+# This removes special characters
+remove_special_chars = function(labs, forbidden_chars = c(',', '-', ';')) {
+  labs = stringr::str_replace_all(labs, '—', ' ')
+  labs = stringr::str_remove_all(labs, paste(forbidden_chars, collapse = '|'))
+  labs = tolower(labs)
+  return(labs)
+}
+
+# This finds the end of the sentence based on a list of end of sentence interpunctions (e.g. the dot marking the end of a sentence)
+get_end_of_sentence = function(words, sentence_end_interpunction = c('.'), include_quotes = FALSE) {
+  return(
+    unlist(
+      lapply(words, function(word) {
+        word_len = nchar(word)
+        # Check which words end with a end of sentence interpunction (e.g., . or ? or !)
+        if (substr(word, word_len, word_len) %in% sentence_end_interpunction) {
+          # If we want to exclude quotes
+          if (!include_quotes) {
+            # Check if the last character before the end of sentence interpunction is not a “
+            if (substr(word, word_len - 1, word_len - 1) != "“") {
+              return(TRUE)
+            }
+          } else {
+            # i.e. include quotes
+            return(TRUE)
+          }
+        }
+        # return FALSE by default
+        return(FALSE)
+      })
+    )
+  )
+}
+
+```
+
+Let's first load the relevant text and remove special characters
+```{r goethe_load_txt, message=F, results='hide', warning=F, cache=T}
+GOETHE_PATH = '../data/sentence_pause_estimation/goethe/'
+# Load basis txt
+con = file(paste0(GOETHE_PATH, 'goethe_fragment.txt'), "r")
+txt = remove_special_chars(readLines(con, n = 1))
+close(con)
+```
+
+Now split the story into words and grab the end of the sentence. Please note that we reject ends of sentences within quotes, e.g. *„Hast du meine Frau nicht gesehen?“* in *„Hast du meine Frau nicht gesehen?“ fragte Eduard, indem er ...*. We only include sentences that end with a dot **(.)**.
+```{r goethe_word_sep, cache=T}
+# Get words
+word_sep_txt = strsplit(txt, " ")[[1]]
+
+# Get word end, exclude quotes and only dots ('.')
+sentence_end = get_end_of_sentence(word_sep_txt)
+
+# Remove special chars
+word_sep_txt = stringr::str_remove_all(word_sep_txt, paste(c('\\.', '„', '\\?', '“', ':', '!'), collapse = "|"))
+```
+
+Next, we grab all TextGrids and iterate through them. For a later pause duration normalisation, we also save the length of single sentences.
+```{r goethe_compute_duration, cache=T}
+tg_names = list.files(GOETHE_PATH, '.TextGrid')
+pauses = NULL
+for (tg_name in tg_names) {
+  # Read the text grid
+  tg = tg.read(paste0(GOETHE_PATH, tg_name), encoding = "auto")
+
+  # Grab the indexes of the not pauses
+  idx = !tg$`ORT-MAU`$label %in% c("", "<p:>")
+
+  # Remove any special characters
+  labels = remove_special_chars(tg$`ORT-MAU`$label[idx])
+
+  # Map all words to the interval index on the textgrid tier
+  look_up_df = data.frame(
+    label = labels,
+    idx = which(idx)
+  )
+
+  # Compute pauses, i.e. the interval after the last word of the sentence
+  pause_idxs = look_up_df[which(sentence_end), "idx"] + 1
+  pause_nb = 1:length(pause_idxs)
+  # Check if the next interval after the end of the sentence is really a pause and not already the first word of the next sentence!
+  if (!all(tg$`ORT-MAU`$label[pause_idxs] %in% c("", "<p:>"))) {
+    warning(paste('Pause missing after sentence:'))
+    idxs = tg$`ORT-MAU`$label[pause_idxs] %in% c("", "<p:>")
+    pause_idxs = pause_idxs[idxs]
+    pause_nb = pause_nb[idxs]
+  }
+
+  # Extract pause durations
+  durations = tg$`ORT-MAU`$t2[pause_idxs] - tg$`ORT-MAU`$t1[pause_idxs]
+
+  # Compute the duration of sentences for speaker normalisation
+  sentence_starts = tg$`ORT-MAU`$t1[c(min(which(!tg$`ORT-MAU`$label %in% c("", "<p:>"))), (pause_idxs + 1))]
+  sentence_ends = tg$`ORT-MAU`$t2[c(pause_idxs - 1, max(which(!tg$`ORT-MAU`$label %in% c("", "<p:>"))))]
+  sentence_durations = (pause_idxs[-1] + 1)
+
+  syllable_rate = c()
+
+  for (i in 1:length(sentence_starts)) {
+    t1 = sentence_starts[i]
+    t2 = sentence_ends[i]
+    idxs = tg$`KAS-MAU`$t1 >= t1 & tg$`KAS-MAU`$t2 < t2
+    labels = tg$`KAS-MAU`$label[idxs]
+    labels = labels[!labels %in% c("", "<p:>")]
+    num_syllables = length(labels) + length(unlist(stringr::str_match_all(labels, "\\.")))
+    syllable_rate = c(syllable_rate, num_syllables / (t2 - t1))
+  }
+
+  # Add the info
+  pauses = rbind(pauses, data.frame(
+    speaker = strsplit(tg_name, "_")[[1]][1],
+    duration = durations,
+    pause_nb = pause_nb,
+    sentence_duration = (sentence_ends - sentence_starts)[-1],
+    syllable_rate = syllable_rate[-1]
+  ))
+}
+```
+
+We can see - as indicated by the warnings above - that some speakers did not produce a pause at the end of every sentence:
+```{r goethe_save, message=F}
+write.csv(pauses, paste0(GOETHE_PATH, 'german_pauses.csv'), row.names = F)
+german_pauses = pauses
+knitr::kable(pauses %>%
+               group_by(speaker) %>%
+               summarise(pauses_per_speaker = length(speaker)))
+```
+
+### Librivox
+In order to compute the BSP distribution on a slightly bigger corpus and on English stories, we use the audio book *Madame Bovary* read online by volunteers of the [Librivox project](https://librivox.org/madame-bovary-by-gustave-flaubert/). The main advantage of the *Librivox* project is that all material can be used (public domain licence), recordings cover different voices and contains a full text version of the text which makes it possible to align the text to audio. *Madame Bovary* contains almost 13 hours of read speech.
+
+We followed the following steps
+1. We first concatenated all sound files downloaded from the project website. Before the recording starts and ends the speaker tells which chapter he or she reads. This information is removed from the recording.
+1. Each chapter was then split up into slightly smaller units (the parser only accepts up to 3000 words at one time) using *Adobe Adition*.
+1. The complete text of the book is split up in the same way
+1. The markers are loaded into R and are used to create a WAV-file for each of the units.
+1. Also, an TXT file with the read text is created
+1. Each unit (so TXT and WAV) is uploaded to the online parser (*Webmaus*) and we get an TextGrid back
+1. In each TextGrid the last word of each sentence and the first word of the following sentence is looked up. This fragment is then extracted.
+1. For each of the fragments, we can compute the silence between the words (needs to be done!).
+
+Only the last two steps are in this script. If you want to know how we did the previous steps, you can contact me via email.
+
+Before we start, we define some helper functions
+```{r librevox_helpers, cache = T}
+LIBREVOX_DATA_DIR = '../data/sentence_pause_estimation/librivox/'
+remove_special_chars = function(wl, replace_digits_with_words = TRUE) {
+  wl_stripped = unlist(lapply(stringr::str_extract_all(wl, "[a-z]|[A-Z]|\\d"), function(char_array) {
+    word = paste0(char_array, collapse = "")
+
+    if (replace_digits_with_words) {
+      if (paste0(stringr::str_extract_all(word, "\\d")[[1]], collapse = "") == word) {
+        word = stringr::str_replace_all(english::as.english(as.numeric(word)), " ", "")
+        word = stringr::str_replace_all(word, "-", "")
+      }
+    }
+
+    return(word)
+  }))
+  return(wl_stripped)
+}
+
+compare_word_lists = function(wl1, wl2) {
+  end_idx = min(length(wl1), length(wl2))
+  word_comparison = wl1[1:end_idx] == wl2[1:end_idx]
+  if (all(word_comparison)) {
+    return(TRUE)
+  } else {
+    start_idx = head(which(word_comparison == FALSE), 1)
+    idxs = (start_idx - 2):(start_idx + 2)
+    print(idxs)
+    print(wl1[idxs])
+    print(wl2[idxs])
+    return(FALSE)
+  }
+}
+
+SAMPA_decode = read.csv(paste0(LIBREVOX_DATA_DIR, 'SAMPA_voicedness.csv'))
+get_voicedness = function(sampa_chars) {
+  voiced_array = c()
+  for (sampa_char in sampa_chars) {
+    voiced_array = c(voiced_array, SAMPA_decode[SAMPA_decode$SAMPA == sampa_char, "voicedness"] == "voiced")
+  }
+  return(voiced_array)
+}
+```
+
+We can start now:
+```{r librevox_load_txt, message=F, results='hide', warning=F, cache=T}
+# Uncomment if you want to run it; it takes a very long time...
+# split_fragments = NULL
+# files = stringr::str_replace(list.files(LIBREVOX_DATA_DIR, '.TextGrid'), '.TextGrid', '')
+# t_c = 0
+# count = 0
+#
+# for (title in files){
+#   t_c = t_c + 1
+#   tg = tg.read(paste0(LIBREVOX_DATA_DIR, title, '.TextGrid'))
+#   tg_labels = tg$`ORT-MAU`$label
+#
+#   pt = pt.read(paste0(LIBREVOX_DATA_DIR, title, '.PitchTier'))
+#   time_lag = diff(pt$t)
+#   samp_rate = median(time_lag)
+#
+#   pt_na_t = c()
+#   pt_na_f = c()
+#   for (i in 1:length(time_lag)){
+#     missing_points = round(time_lag[i]/samp_rate) - 1
+#     t = c(pt$t[i])
+#     f = c(pt$f[i])
+#
+#     if (missing_points > 0){
+#       t = c(t, seq(from = t + samp_rate, to = t + missing_points*samp_rate, by = samp_rate))
+#       f = c(f, rep(NA, missing_points))
+#     }
+#     pt_na_t = c(pt_na_t, t)
+#     pt_na_f = c(pt_na_f, f)
+#   }
+#
+#   word_idx_bool = !tg_labels %in% c("", "’", "‘")
+#
+#   tg_label_words = tg_labels[word_idx_bool]
+#
+#   tg_label_words = remove_special_chars(tg_label_words)
+#
+#   word_lookup_df = data.frame(
+#     label = tg_labels[word_idx_bool],
+#     idx = which(word_idx_bool)
+#   )
+#
+#   con = file(paste0(LIBREVOX_DATA_DIR, title, ".txt"), "r")
+#   lines = c()
+#   while (TRUE) {
+#     line = readLines(con, n = 1)
+#     if ( length(line) == 0 ) {
+#       break
+#     }
+#     lines = c(lines, line)
+#   }
+#   close(con)
+#
+#   flat_str = gsub("\\s+", " ", stringr::str_trim(paste(lines, collapse = " ")))
+#   word_list = strsplit(flat_str, " ")[[1]]
+#   word_list_stripped = remove_special_chars(word_list, TRUE)
+#
+#   # Remove empty words
+#   non_empty_word_idx = word_list_stripped != ""
+#   word_list_stripped = word_list_stripped[non_empty_word_idx]
+#   word_list = word_list[non_empty_word_idx]
+#
+#   # Check if they match with the TextGrid
+#   if (length(word_list_stripped) != length(tg_label_words)) {
+#     stop("Check the prints above")
+#   } else {
+#     # !!!!!!
+#     # get idx of sentence end (only looking at dots)
+#     sentence_end_idx = grep("\\.", word_list)
+#
+#     # remove the last sentence (since there is not a word following!)
+#     sentence_end_idx = sentence_end_idx[1:(length(sentence_end_idx) - 1)]
+#
+#     # Compute the start idx for the sentences
+#     sentence_start_idx = sentence_end_idx + 1
+#
+#     # !!!!!!
+#     # Exclude one-word-sentences, like exlamations as "Silence!" or "Louder!"
+#     idx = !grepl("\\.|\\?|\\!", word_list[sentence_start_idx])
+#     sentence_start_idx = sentence_start_idx[idx]
+#     sentence_end_idx = sentence_end_idx[idx]
+#
+#     # Map word idxs to TG tier idxs
+#     tg_start_idx = word_lookup_df[sentence_start_idx,]$idx
+#     tg_end_idx = word_lookup_df[sentence_end_idx,]$idx
+#
+#     # Now grab the start of the fragment
+#     fragment_start = tg$`ORT-MAU`$t1[tg_end_idx]
+#     fragment_end = tg$`ORT-MAU`$t2[tg_start_idx]
+#
+#     pitch_durations = c()
+#     for (f in 1:length(fragment_start)){
+#       # Get the pitch points for a given word
+#       idxs = which(pt_na_t >= fragment_start[f] & pt_na_t < fragment_end[f])
+#       pitch_points = pt_na_f[idxs]
+#
+#       # Trim first and end
+#       trim_start = 1
+#       for (p in is.na(pitch_points)){
+#         if (p){
+#           trim_start = trim_start + 1
+#         } else {
+#           break
+#         }
+#       }
+#
+#       trim_end = length(pitch_points)
+#       for (p in rev(is.na(pitch_points))){
+#         if (p){
+#           trim_end = trim_end - 1
+#         } else {
+#           break
+#         }
+#       }
+#
+#       pitch_points = pitch_points[trim_start:trim_end]
+#       voiceless = which(is.na(pitch_points))
+#       duration = NA
+#       if (length(voiceless) > 0){
+#         if (length(voiceless) == (max(voiceless) - min(voiceless) + 1)){
+#           duration = length(voiceless) * samp_rate
+#         }
+#       }
+#
+#       pitch_durations = c(pitch_durations, duration)
+#     }
+#
+#     pause_durations = tg$`ORT-MAU`$t2[tg_start_idx] - tg$`ORT-MAU`$t1[tg_end_idx]
+#
+#     phone_last_words = unlist(
+#       lapply(strsplit(tg$`KAN-MAU`$label[tg_end_idx], " "), function(x) tail(x,1))
+#     )
+#     phone_first_words = unlist(
+#       lapply(strsplit(tg$`KAN-MAU`$label[tg_start_idx], " "), function(x) head(x,1))
+#     )
+#
+#     if (!all(phone_last_words %in% SAMPA_decode$SAMPA)){
+#       stop('All phones must be valid SAMPA symbols')
+#     }
+#
+#     if (!all(phone_first_words %in% SAMPA_decode$SAMPA)){
+#       stop('All phones must be valid SAMPA symbols')
+#     }
+#
+#
+#
+#     if (!all(fragment_end > fragment_start)){
+#       stop('illegal state!')
+#     }
+#     durations = fragment_end - fragment_start
+#
+#     numbered_files = (1:length(sentence_start_idx)) + count
+#     filenames = paste0(numbered_files, ".wav")
+#
+#     word_pairs = unlist(lapply(1:length(sentence_start_idx), function(i){
+#       wl_idx = sentence_end_idx[i]
+#       paste(word_list[c(wl_idx, wl_idx + 1)], collapse = " ")
+#     }))
+#
+#     infos = strsplit(title, "_")[[1]]
+#
+#     split_fragments = rbind(split_fragments, data.frame(
+#       filename = filenames,
+#       word_pair = word_pairs,
+#       start = fragment_start,
+#       stop = fragment_end,
+#       voiced_last_word = get_voicedness(phone_last_words),
+#       voiced_first_word = get_voicedness(phone_first_words),
+#       pause_duration = pause_durations,
+#       pitch_duration = pitch_durations,
+#       file_nb_librevox = infos[1],
+#       part = infos[2],
+#       chapter = infos[3],
+#       part = infos[4],
+#       speaker = infos[5]
+#     ))
+#
+#     count = count + length(sentence_start_idx)
+#     print(count)
+#   }
+# }
+```
+
+```{r librevox_save, cache=T}
+# write.csv(split_fragments, paste0(LIBREVOX_DATA_DIR, "split_fragments.csv"))
+```
+
+## Compare distributions
+The story corpus clearly has a deviating distribution
+```{r plot_distributions, cache = T}
+
+librevox_pauses = read.csv(paste0(LIBREVOX_DATA_DIR, "split_fragments.csv"))
+library(viridis)
+ggplot() +
+  geom_density(data = german_pauses, aes(x = duration, color = "Goethe"), lwd = 1) +
+  geom_density(data = librevox_pauses, aes(x = pause_duration, color = "Librevox"), lwd = 1) +
+  stat_function(data = data.frame(x = c(0, 6)), aes(x, color = 'Estimated density'), fun = dnorm, n = 101, args = list(mean = 1.25, sd = 0.5), lwd = 2) +
+  labs(x = 'Duration (seconds)', y = 'Density', color = 'Type') +
+  theme_classic() +
+  theme(legend.position = 'bottom', text = element_text(size = 14, color = 'black'), legend.text = element_text(size = 13), axis.text = element_text(size = 13, color = 'black')) +
+  scale_colour_viridis_d()
+#geom_density(data = story_corpus, aes(x = duration, color = "Story corpus"))
+ggsave('densities.pdf', device = cairo_pdf)
+
+goethe.fit.norm = fitdist(german_pauses$duration, "norm")
+print(goethe.fit.norm)
+plot(goethe.fit.norm)
+
+librevox.fit.norm = fitdist(librevox_pauses$pause_duration, "norm")
+print(librevox.fit.norm)
+plot(librevox.fit.norm)
+```
+
+## Re-synthesize with new distribution
+```{r plot_fitted_distribution, cache = T}
+NUM_STORIES = 8
+NUM_SPEAKERS = 2
+NUM_PAUSES = nrow(story_corpus) +
+  (NUM_STORIES * NUM_SPEAKERS) +
+  1
+set.seed(1)
+pauses = rnorm(NUM_PAUSES, 1.25, 0.5)
+pauses[pauses < 0.2] = 0.2
+plot(density(pauses), main = "Mean = 1.25, sd = 0.5 seconds")
+```
+
+```{r write_stories, cache = T}
+SENTENCE_PATH = '../data/stories/sentences/'
+NEW_STORY_PATH = '../data/stories/stories_corrected_pauses/'
+
+###########
+# Modify word_df
+###########
+word_df = read.csv(paste0(SENTENCE_PATH, 'relative_word_durations.csv'))
+# Female
+story_4_F = filter(word_df, story == 4, gender == 'F')
+idxs = which(story_4_F$sent_ID == '49a')
+story_4_F_before = story_4_F[1:(min(idxs) - 1),]
+
+story_4_F_between = filter(word_df, gender == 'F', story == 1, sent_ID == '55a')
+story_4_F_between$sent_ID = '49a'
+story_4_F_between$sentence = 102
+story_4_F_between$story = 4
+between_duration = max(story_4_F_between$t2)
+
+story_4_F_after = story_4_F[(max(idxs) + 1):nrow(story_4_F),]
+story_4_F_new = rbind(story_4_F_before, story_4_F_between, story_4_F_after)
+
+# Male
+story_4_M = filter(word_df, story == 4, gender == 'M')
+idxs = which(story_4_M$sent_ID == '49b')
+story_4_M_before = story_4_M[1:(min(idxs) - 1),]
+
+story_4_M_between = filter(word_df, gender == 'M', story == 1, sent_ID == '55a')
+story_4_M_between$sent_ID = '49a'
+story_4_M_between$sentence = 102
+story_4_M_between$story = 4
+
+story_4_M_after = story_4_M[(min(idxs) + 1):nrow(story_4_M),]
+story_4_M_after$sentence = story_4_M_after$sentence + 1
+story_4_M_new = rbind(story_4_M_before, story_4_M_between, story_4_M_after)
+
+# remove story 4
+word_df = word_df[word_df$story != 4,]
+word_df = rbind(word_df, story_4_M_new, story_4_F_new)
+
+word_df$gender = factor(word_df$gender, levels = c("M", "F"))
+word_df = word_df %>% arrange(gender, story, sentence, t1)
+
+# Modify sentence files
+get_filename = function(gender, story, id) {
+  return(sprintf('%s%s_%d_%s.wav', SENTENCE_PATH, gender, story, id))
+}
+
+file.remove(get_filename('F', 4, '49a'))
+file.copy(get_filename('F', 1, '55a'), get_filename('F', 4, '49a'))
+file.copy(get_filename('M', 1, '55a'), get_filename('M', 4, '49a'))
+
+# You can see all stories contain 133
+word_df %>%
+  group_by(gender, story) %>%
+  summarise(c = length(unique(sentence)))
+
+new_word_df = NULL
+pause_count = 0
+for (g in c('M', 'F')) {
+  for (s in 1:8) {
+    first_sentence = TRUE
+    duration_count = 0
+    for (sent in 1:133) {
+      id = filter(word_df, gender == g, story == s, sentence == sent)[1, "sent_ID"]
+
+      words_in_sentence = filter(word_df, gender == g, story == s, sent_ID == id)
+
+      sentence_duration_time = max(words_in_sentence$t2)
+      words_in_sentence$t1 = words_in_sentence$t1 + duration_count
+      words_in_sentence$t2 = words_in_sentence$t2 + duration_count
+      new_word_df = rbind(new_word_df, words_in_sentence)
+
+      pause_count = pause_count + 1
+      pause = pauses[pause_count]
+      # # create silence
+      silence_name = 'silence.wav'
+      system(sprintf('sox -n -r 11025 -c 1 %s trim 0.0 %f', silence_name, pause))
+
+      filename = get_filename(g, s, id)
+
+      target = sprintf('%s%s_%d.wav', NEW_STORY_PATH, g, s)
+      tmp_target = sprintf('%s%s_%d_temp.wav', NEW_STORY_PATH, g, s)
+
+      if (first_sentence) {
+        system(sprintf('sox %s %s %s', filename, silence_name, tmp_target))
+      } else {
+        system(sprintf('sox %s %s %s %s', target, filename, silence_name, tmp_target))
+      }
+      file.rename(tmp_target, target)
+      first_sentence = FALSE
+
+      duration_count = duration_count + pause + sentence_duration_time
+    }
+  }
+}
+```
+
+# Annotate
+
+## Syntactic
+```{r}
+syntax_new_word_df = read.csv(paste0(NEW_STORY_PATH, 'syntactic_annotation.csv'))
+new_word_df = cbind(new_word_df, syntax_new_word_df[c('trace', 'POS_stanf')])
+names(new_word_df)[6] = 'sentence_id'
+names(new_word_df)[10] = 'stn_pos'
+```
+
+## Experimental conditions
+```{r}
+story_variables = read_excel('../data/stories/original/Stories_Variables.xlsx', sheet = 3)
+column_names = c("condition", "freq_condition", "num_words_sent", "sent_len", "sent_position", "sem_context", "syntactic_precition", "kw_category", "kw_elp_pos", "kw_lfw", "kw_cv", "kw_len", "kw_num_morphs", "kw_num_phons", "kw_primary_syll_stress", "kw_num_sylls", "kw_morph_parse", "kw_sampa", "syn_coca_freq", "synkw_coca_freq")
+
+ids = levels(new_word_df$sentence_id)
+
+fill_roles = function(key, name_role, words, roles) {
+  for (subkey in strsplit(key, " |-")[[1]]) {
+    idx = which(words == subkey)
+    if (length(idx) != 1) {
+      print(key)
+      print(subkey)
+      print(words)
+      if (length(idx) == 0) {
+        if (key == 'TEAM NAME') {
+          next
+        } else {
+          stop('This may not happen')
+        }
+      } else {
+        warning('Multiple times the same word, taking the last one')
+        idx = tail(idx, 1)
+      }
+    }
+    roles[idx] = name_role
+  }
+  return(roles)
+}
+
+for (g in c('M', 'F')) {
+  for (s in 1:8) {
+    for (sent_ID in ids[grep('b', ids)]) {
+      a_sent_ID = stringr::str_replace(sent_ID, 'b', 'a')
+
+      if (s == 4 & a_sent_ID == '49a') {
+        s = 1
+        a_sent_ID = '55a'
+        sent_ID = '55b'
+      }
+
+      allowed_IDs = c(a_sent_ID, sent_ID)
+      row_idx = new_word_df$sentence_id %in% allowed_IDs &
+        new_word_df$gender == g &
+        new_word_df$story == s
+
+
+      meta_row = filter(story_variables, SentID == sent_ID, Story == s)
+      if (nrow(meta_row) != 1) {
+        stop('This may not happen')
+      }
+
+      # a pairs
+      words_a = filter(new_word_df, sentence_id == a_sent_ID, gender == g, story == s)$word
+      roles_a = rep('', length(words_a))
+      semantic_context = stringr::str_replace_all(toupper(meta_row$sem), '<|>', '')
+      roles_a = fill_roles(semantic_context, 'prior_context', words_a, roles_a)
+
+      # b pairs
+      words_b = filter(new_word_df, sentence_id == sent_ID, gender == g, story == s)$word
+      roles_b = rep('', length(words_b))
+      keyword = toupper(meta_row$kw)
+      roles_b = fill_roles(keyword, 'keyword', words_b, roles_b)
+
+      syntactic_word = stringr::str_replace_all(toupper(meta_row$syn), '\\[|\\]', '')
+      roles_b = fill_roles(syntactic_word, 'local_context', words_b, roles_b)
+
+      roles = c(roles_a, roles_b)
+      new_word_df[row_idx, "roles"] = roles
+
+      # Global sentence attributes
+      for (col in column_names) {
+        new_word_df[row_idx, col] = meta_row[[col]]
+      }
+    }
+  }
+}
+
+# Correct the column names
+correct_names = function (df, old_name, new_name){
+  if (!old_name %in% names(df)){
+    stop('Name not in df')
+  }
+  idx = which(names(df) == old_name)
+  names(df)[idx] = new_name
+  return(df)
+}
+
+new_word_df = correct_names(new_word_df, 'trace', 'stn_trace')
+
+new_word_df = correct_names(new_word_df, 'freq_condition', 'kw_freq_condition')
+
+new_word_df = correct_names(new_word_df, 'sent_position', 'syntactic_position')
+new_word_df = correct_names(new_word_df, 'sem_context', 'local_context')
+new_word_df = correct_names(new_word_df, 'syntactic_precition', 'prior_context')
+
+new_word_df = correct_names(new_word_df, 'kw_morph_parse', 'kw_morph')
+new_word_df = correct_names(new_word_df, 'kw_sampa', 'kw_phon')
+
+new_word_df = correct_names(new_word_df, 'syn_coca_freq', 'local_coca_freq')
+new_word_df = correct_names(new_word_df, 'synkw_coca_freq', 'local_kw_coca_freq')
+
+
+write.csv(new_word_df, '../public/stories/meta.csv', row.names = F)
+
+
+delay = word_df %>%
+  group_by(gender, story, sent_ID) %>%
+  summarise(t1 = t1[1])
+sentence_df = new_word_df
+for (g in c('M', 'F')) {
+  for (s in 1:8) {
+    for (id in ids) {
+      start_time = filter(delay, gender==g, story==s, sent_ID==id)$t1
+      row_idx = sentence_df$gender == g & sentence_df$story == s & sentence_df$sentence_id == id
+      minus_time = min(sentence_df[row_idx, "t1"])
+      sentence_df[row_idx, "t1"] = sentence_df[row_idx, "t1"] - minus_time + start_time
+      sentence_df[row_idx, "t2"] = sentence_df[row_idx, "t2"] - minus_time + start_time
+
+      tg = tg.createNewTextGrid(0, max(sentence_df[row_idx, "t2"]))
+      tg = tg.insertNewIntervalTier(tg, 1, "word")
+      tg$word$t1 = sentence_df[row_idx, "t1"]
+      tg$word$t2 = sentence_df[row_idx, "t2"]
+      tg$word$label = sentence_df[row_idx, "word"]
+      tg.write(tg, sprintf('../data/stories/sentences/%s_%d_%s.TextGrid', g, s, id))
+    }
+  }
+}
+
+write.csv(sentence_df, '../public/sentences/meta.csv', row.names = F)
+```
+
+## Create TextGrids
+```{r}
+library(rPraat)
+for (s in 1:8) {
+  for (g in c("M", "F")) {
+    story_df = filter(new_word_df, gender == g, story == s)
+    tg = tg.createNewTextGrid(0, max(story_df$t2))
+    tg = tg.insertNewIntervalTier(tg, 1, "word")
+    tg$word$t1 = story_df$t1
+    tg$word$t2 = story_df$t2
+    tg$word$label = story_df$word
+    tg.write(tg, sprintf('../data/stories/stories_corrected_pauses/%s_%d.TextGrid', g, s))
+  }
+}
+```
